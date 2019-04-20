@@ -213,6 +213,7 @@ name = "miri-repl-test"
 version = "0.1.0"
 dependencies = [
  "miri 0.1.0 (git+https://github.com/rust-lang/miri?rev=96b22259cc0bacfeb7ca7fb9a370cf23e4649c36)",
+ "rustc_version 0.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
