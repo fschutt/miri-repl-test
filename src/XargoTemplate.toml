@@ -3,7 +3,6 @@ default_features = false
 # We need the `panic_unwind` feature because we use the `unwind` panic strategy.
 # Using `abort` works for libstd, but then libtest will not compile.
 features = ["panic_unwind"]
-path = "{}"
 
 [dependencies.test]
 stage = 1

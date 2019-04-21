@@ -21,9 +21,7 @@ fn main() {
 
     let cache_key = 0;
     let file_path = "./src/game_script.rs";
-    let stdlib_path = "target/miri-stdlib";
-
-    setup::setup(stdlib_path).unwrap();
+    setup::setup().unwrap();
 
     'game_loop: loop {
 
@@ -133,7 +131,7 @@ mod setup {
     /// Performs the setup required to make `cargo miri` work: Getting a custom-built libstd. Then sets
     /// `MIRI_SYSROOT`. Skipped if `MIRI_SYSROOT` is already set, in which case we expect the user has
     /// done all this already.
-    pub fn setup<I: Into<PathBuf>>(cache_dir: I) -> Result<(), SetupError> {
+    pub fn setup() -> Result<(), SetupError> {
 
         use std::io::Write;
 
@@ -153,65 +151,64 @@ mod setup {
         let xargo_version = xargo_version().unwrap();
         println!("OK xargo {}.{}.{} installed!", xargo_version.0, xargo_version.1, xargo_version.2);
 
+        let sysroot = Command::new("rustc").args(&["--print", "sysroot"]).output().unwrap().stdout;
+        let sysroot = std::str::from_utf8(&sysroot).unwrap();
+        let sysroot_path = Path::new(sysroot.trim_end_matches('\n'));
+        let src = sysroot_path.clone().join("lib").join("rustlib").join("src");
+
         // Then, unless `XARGO_RUST_SRC` is set, we also need rust-src.
         // Let's see if it is already installed.
-        if env::var("XARGO_RUST_SRC").is_err() {
+        if !src.exists() {
 
-            let sysroot = Command::new("rustc").args(&["--print", "sysroot"]).output().unwrap().stdout;
-            let sysroot = std::str::from_utf8(&sysroot).unwrap();
-            let src = Path::new(sysroot.trim_end_matches('\n')).join("lib").join("rustlib").join("src");
+            println!("Installing rust-src component: `rustup component add rust-src`");
 
-            if !src.exists() {
-                println!("Installing rust-src component: `rustup component add rust-src`");
-                if !Command::new("rustup").args(&["component", "add", "rust-src"]).status().unwrap().success() {
-                    return Err(SetupError::FailedToInstallRustSrc);
-                }
+            if !Command::new("rustup").args(&["component", "add", "rust-src"]).status().unwrap().success() {
+                return Err(SetupError::FailedToInstallRustSrc);
             }
 
-            env::set_var("XARGO_RUST_SRC", &PathBuf::from(src));
+            env::set_var("XARGO_RUST_SRC", src.clone());
         }
 
-        // Next, we need our own libstd. We will do this work in whatever is a good cache dir for this platform.
-        let cache_dir: PathBuf = cache_dir.into();
+        // Next, we need our own libstd. We will do this work in whatever is a
+        // good cache dir for this platform.
+        let cache_dir: PathBuf = "target/miri".into();
         let cache_dir: &Path = cache_dir.as_path();
-
-        if !cache_dir.exists() {
-            fs::create_dir_all(cache_dir).unwrap();
-        }
+        fs::create_dir_all(cache_dir).unwrap();
 
         // The interesting bit: Xargo.toml
         File::create(cache_dir.join("Xargo.toml")).unwrap().write_all(include_bytes!("./XargoTemplate.toml")).unwrap();
+
+        // Workaround for https://github.com/rust-lang/cargo/issues/6139 - RUSTFLAGS can't contain spaces
+        // Creates a .cargo/config file with the sysroot as the value
+        let sysroot_src_dir = sysroot_path.to_string_lossy();
+        let sysroot_src_dir = sysroot_src_dir.replace(r#"\"#,r#"\\"#);
+        let dot_cargo_contents = format!(include_str!("./dotcargoTemplate.toml"), sysroot_src_dir);
+        let dot_cargo_path = cache_dir.join(".cargo");
+        fs::create_dir_all(dot_cargo_path.clone()).unwrap();
+        File::create(dot_cargo_path.join("config")).unwrap().write_all(dot_cargo_contents.as_bytes()).unwrap();
+
         // The boring bits: a dummy project for xargo.
         File::create(cache_dir.join("Cargo.toml")).unwrap().write_all(include_bytes!("./CargoTemplate.toml")).unwrap();
         File::create(cache_dir.join("lib.rs")).unwrap();
 
-        // Run xargo.
-        let target = get_arg_flag_value("--target");
+        println!("running xargo");
+
+        // Run xargo
         let mut command = Command::new("xargo");
-        command.arg("build").arg("-q")
-            .current_dir(cache_dir)
+            command
+            .arg("build")
+            .arg("--verbose")
+            .arg("-q").current_dir(cache_dir)
             .env("RUSTFLAGS", miri::miri_default_args().join(" "))
-            .env("XARGO_HOME", cache_dir.to_str().unwrap());
+            .env("XARGO_HOME", cache_dir);
 
-        if let Some(ref target) = target {
-            command.arg("--target").arg(&target);
-        }
+        println!("command: {:?}", command);
 
-        if !command.status().unwrap().success() {
+        if !command.status().unwrap().success() { // <-- fails here
             return Err(SetupError::FailedToRunXargo);
         }
 
-        // That should be it! But we need to figure out where xargo built stuff.
-        // Unfortunately, it puts things into a different directory when the
-        // architecture matches the host.
-        let is_host = match target {
-            None => true,
-            Some(target) => target == rustc_version::version_meta().unwrap().host,
-        };
-
-        let sysroot = if is_host { cache_dir.join("HOST") } else { PathBuf::from(cache_dir) };
-
-        env::set_var("MIRI_SYSROOT", &sysroot);
+        env::set_var("MIRI_SYSROOT", &cache_dir.join("HOST"));
 
         Ok(())
     }
@@ -261,29 +258,5 @@ mod setup {
         }
 
         Some((major, minor, patch))
-    }
-
-    fn get_arg_flag_value(name: &str) -> Option<String> {
-        // Stop searching at `--`.
-        let mut args = std::env::args().take_while(|val| val != "--");
-        loop {
-            let arg = match args.next() {
-                Some(arg) => arg,
-                None => return None,
-            };
-            if !arg.starts_with(name) {
-                continue;
-            }
-            // Strip leading `name`.
-            let suffix = &arg[name.len()..];
-            if suffix.is_empty() {
-                // This argument is exactly `name`; the next one is the value.
-                return args.next();
-            } else if suffix.starts_with('=') {
-                // This argument is `name=value`; get the value.
-                // Strip leading `=`.
-                return Some(suffix[1..].to_owned());
-            }
-        }
     }
 }
